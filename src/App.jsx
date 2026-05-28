@@ -1,41 +1,24 @@
 import { useState, useEffect, useRef } from "react";
+import sentinelViolet from "../sentinel_violet.png";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const CONFIG = {
-  LAMBDA_URL: "https://y2iqqe7272fka6ooesyniq5tnq0sginw.lambda-url.us-east-1.on.aws/", // Replace with your AWS Lambda URL
+  LAMBDA_URL: "https://y2iqqe7272fka6ooesyniq5tnq0sginw.lambda-url.us-east-1.on.aws/",
   REDIRECT_URL: "https://live.sentinelurl.site",
-  BOOT_DURATION_MS: 18000, // ~18 seconds total boot
+  POLL_INTERVAL_MS: 5000,   // check every 5 s
+  POLL_START_DELAY_MS: 6000, // first check after 6 s (EC2 won't be up before this)
 };
 
-// ─── BOOT LOG MESSAGES ─────────────────────────────────────────────────────
-const BOOT_STEPS = [
-  { pct: 3,  msg: "Initializing Sentinel kernel...",           tag: "SYS"  },
-  { pct: 8,  msg: "Invoking AWS Lambda cold-start...",         tag: "AWS"  },
-  { pct: 14, msg: "Lambda execution environment ready",        tag: "AWS"  },
-  { pct: 20, msg: "Provisioning EC2 instance (t3.medium)...",  tag: "EC2"  },
-  { pct: 28, msg: "Instance state: PENDING → RUNNING",         tag: "EC2"  },
-  { pct: 35, msg: "Waiting for system checks to pass...",      tag: "EC2"  },
-  { pct: 42, msg: "SSH daemon online. Services initializing.", tag: "SYS"  },
-  { pct: 50, msg: "Fetching new public IPv4 address...",       tag: "NET"  },
-  { pct: 57, msg: "Updating Namecheap DNS A-record...",        tag: "DNS"  },
-  { pct: 63, msg: "DNS propagation in progress (TTL 60s)...",  tag: "DNS"  },
-  { pct: 70, msg: "Verifying domain resolution...",            tag: "DNS"  },
-  { pct: 76, msg: "Starting threat intelligence pipeline...",  tag: "APP"  },
-  { pct: 82, msg: "Loading ML scoring models...",              tag: "APP"  },
-  { pct: 88, msg: "Sandbox environment warm and ready.",       tag: "APP"  },
-  { pct: 94, msg: "Health check passed. All systems nominal.", tag: "SYS"  },
-  { pct: 100,msg: "SURL is live. Redirecting...",              tag: "OK"   },
+// ─── TIMED STATUS MESSAGES ─────────────────────────────────────────────────
+// Each entry appears after `delay` ms regardless of poll result.
+const STATUS_TIMELINE = [
+  { delay:    500, text: "Lambda function triggered",                     type: "success" },
+  { delay:   2500, text: "EC2 instance starting up…",                     type: "info"    },
+  { delay:   8000, text: "Cold start can take 30–90 seconds",             type: "warn"    },
+  { delay:  20000, text: "Server auto-stops after 15 min of inactivity",  type: "warn"    },
+  { delay:  40000, text: "Still warming up — please wait",                type: "muted"   },
+  { delay:  75000, text: "Taking longer than usual, almost there…",       type: "muted"   },
 ];
-
-const TAG_COLORS = {
-  SYS: "#a78bfa",
-  AWS: "#f97316",
-  EC2: "#fb923c",
-  NET: "#38bdf8",
-  DNS: "#34d399",
-  APP: "#60a5fa",
-  OK:  "#4ade80",
-};
 
 // ─── PARTICLE CANVAS ───────────────────────────────────────────────────────
 function ParticleCanvas() {
@@ -121,35 +104,21 @@ function ParticleCanvas() {
   );
 }
 
-// ─── SCAN ANIMATION SVG ────────────────────────────────────────────────────
-function ShieldIcon({ size = 64 }) {
+// ─── BRAND ICON ───────────────────────────────────────────────────────────
+function SentinelIcon({ size = 64 }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 64 64" fill="none">
-      <defs>
-        <linearGradient id="sg" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stopColor="#a78bfa" />
-          <stop offset="100%" stopColor="#6d28d9" />
-        </linearGradient>
-      </defs>
-      <path
-        d="M32 4L10 14v16c0 13.5 9.5 26.1 22 29.4C44.5 56.1 54 43.5 54 30V14L32 4z"
-        fill="url(#sg)"
-        opacity="0.15"
-      />
-      <path
-        d="M32 4L10 14v16c0 13.5 9.5 26.1 22 29.4C44.5 56.1 54 43.5 54 30V14L32 4z"
-        stroke="#a78bfa"
-        strokeWidth="1.5"
-        fill="none"
-      />
-      <path
-        d="M22 31l7 7 13-14"
-        stroke="#a78bfa"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
+    <img
+      src={sentinelViolet}
+      alt=""
+      aria-hidden="true"
+      draggable="false"
+      style={{
+        width: size,
+        height: size,
+        objectFit: "contain",
+        display: "block",
+      }}
+    />
   );
 }
 
@@ -165,113 +134,93 @@ function FeatureCard({ icon, title, desc }) {
 }
 
 // ─── BOOT OVERLAY ──────────────────────────────────────────────────────────
-function BootOverlay({ onDone }) {
-  const [progress, setProgress] = useState(0);
-  const [logs, setLogs] = useState([]);
-  const [currentStep, setCurrentStep] = useState(0);
-  const logsRef = useRef(null);
-  const startTime = useRef(Date.now());
+function BootOverlay() {
+  const [messages, setMessages]   = useState([]);
+  const [dots, setDots]           = useState("");
+  const [redirecting, setRedirecting] = useState(false);
+  const pollTimer   = useRef(null);
+  const timers      = useRef([]);
+
+  const addMsg = (text, type) =>
+    setMessages((prev) => [...prev, { id: Date.now() + Math.random(), text, type }]);
 
   useEffect(() => {
-    // Fire Lambda (fire and forget – UI is time-driven)
+    // 1. Fire Lambda (fire-and-forget)
     fetch(CONFIG.LAMBDA_URL, { method: "POST" }).catch(() => {});
+
+    // 2. Schedule informational messages
+    STATUS_TIMELINE.forEach(({ delay, text, type }) => {
+      const t = setTimeout(() => addMsg(text, type), delay);
+      timers.current.push(t);
+    });
+
+    // 3. Poll the live site — resolves when EC2 is actually reachable
+    const tryConnect = () => {
+      fetch(CONFIG.REDIRECT_URL, { mode: "no-cors" })
+        .then(() => {
+          // Opaque response = server is up
+          setRedirecting(true);
+          addMsg("Server is live — redirecting now", "success");
+          pollTimer.current = setTimeout(() => {
+            window.location.href = CONFIG.REDIRECT_URL;
+          }, 1800);
+        })
+        .catch(() => {
+          // Network error = still down, retry
+          pollTimer.current = setTimeout(tryConnect, CONFIG.POLL_INTERVAL_MS);
+        });
+    };
+    pollTimer.current = setTimeout(tryConnect, CONFIG.POLL_START_DELAY_MS);
+
+    // 4. Animate waiting dots
+    const dotsInterval = setInterval(
+      () => setDots((d) => (d.length >= 3 ? "" : d + ".")),
+      500
+    );
+
+    return () => {
+      timers.current.forEach(clearTimeout);
+      clearTimeout(pollTimer.current);
+      clearInterval(dotsInterval);
+    };
   }, []);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const elapsed = Date.now() - startTime.current;
-      const rawPct = Math.min((elapsed / CONFIG.BOOT_DURATION_MS) * 100, 100);
-      const pct = Math.round(rawPct);
-      setProgress(pct);
-
-      // Emit log lines as we pass each step threshold
-      setCurrentStep((prev) => {
-        let next = prev;
-        while (
-          next < BOOT_STEPS.length &&
-          pct >= BOOT_STEPS[next].pct
-        ) {
-          const step = BOOT_STEPS[next];
-          setLogs((l) => [
-            ...l,
-            { ...step, ts: new Date().toISOString().slice(11, 23) },
-          ]);
-          next++;
-        }
-        return next;
-      });
-
-      if (pct >= 100) {
-        clearInterval(interval);
-        setTimeout(() => {
-          window.location.href = CONFIG.REDIRECT_URL;
-          onDone?.();
-        }, 1200);
-      }
-    }, 80);
-    return () => clearInterval(interval);
-  }, [onDone]);
-
-  useEffect(() => {
-    if (logsRef.current) {
-      logsRef.current.scrollTop = logsRef.current.scrollHeight;
-    }
-  }, [logs]);
 
   return (
     <div className="boot-overlay">
-      <div className="boot-box">
-        <div className="boot-header">
-          <ShieldIcon size={36} />
-          <div>
-            <div className="boot-title">SENTINEL BOOT SEQUENCE</div>
-            <div className="boot-subtitle">Provisioning secure environment…</div>
+      <div className="boot-card">
+
+        {/* Shield icon */}
+        <div className={`boot-icon ${redirecting ? "boot-icon--done" : ""}`}>
+          <SentinelIcon size={44} />
+        </div>
+
+        {/* Title + subtitle */}
+        <div className="boot-head">
+          <div className="boot-title">SURL IS STARTING</div>
+          <div className="boot-subtitle">
+            {redirecting
+              ? "Redirecting you to the app…"
+              : `Waiting for server${dots}`}
           </div>
-          <div className="boot-pct">{progress}%</div>
         </div>
 
-        {/* Progress bar */}
-        <div className="progress-track">
-          <div
-            className="progress-fill"
-            style={{ width: `${progress}%` }}
-          />
-          <div
-            className="progress-glow"
-            style={{ left: `${progress}%` }}
-          />
+        {/* Indeterminate / complete progress bar */}
+        <div className="boot-bar-track">
+          <div className={`boot-bar-fill ${
+            redirecting ? "boot-bar-fill--done" : "boot-bar-fill--running"
+          }`} />
         </div>
 
-        {/* Log terminal */}
-        <div className="log-terminal" ref={logsRef}>
-          {logs.map((l, i) => (
-            <div key={i} className="log-line">
-              <span className="log-ts">{l.ts}</span>
-              <span className="log-tag" style={{ color: TAG_COLORS[l.tag] }}>
-                [{l.tag}]
-              </span>
-              <span className="log-msg">{l.msg}</span>
-            </div>
-          ))}
-          {progress < 100 && (
-            <div className="log-cursor">
-              <span className="log-ts">{new Date().toISOString().slice(11, 23)}</span>
-              <span className="cursor-blink">█</span>
-            </div>
-          )}
-        </div>
-
-        {/* Step indicators */}
-        <div className="step-bar">
-          {["Lambda", "EC2", "DNS", "App", "Online"].map((s, i) => (
-            <div
-              key={s}
-              className={`step-pill ${progress >= (i + 1) * 20 ? "active" : ""}`}
-            >
-              {s}
+        {/* Status messages */}
+        <div className="boot-msgs">
+          {messages.map((m) => (
+            <div key={m.id} className={`boot-msg boot-msg--${m.type}`}>
+              <span className="boot-msg-dot" />
+              <span>{m.text}</span>
             </div>
           ))}
         </div>
+
       </div>
     </div>
   );
@@ -281,12 +230,24 @@ function BootOverlay({ onDone }) {
 export default function App() {
   const [booting, setBooting] = useState(false);
   const [visible, setVisible] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   useEffect(() => {
     setTimeout(() => setVisible(true), 100);
   }, []);
 
-  const handleStart = () => setBooting(true);
+  // Close mobile menu on route change / scroll lock
+  useEffect(() => {
+    document.body.style.overflow = menuOpen ? "hidden" : "";
+    return () => { document.body.style.overflow = ""; };
+  }, [menuOpen]);
+
+  const handleStart = () => {
+    setMenuOpen(false);
+    setBooting(true);
+  };
+
+  const closeMenu = () => setMenuOpen(false);
 
   return (
     <>
@@ -295,7 +256,7 @@ export default function App() {
       {/* ── NAV ── */}
       <nav className={`nav ${visible ? "nav-in" : ""}`}>
         <div className="nav-brand">
-          <ShieldIcon size={28} />
+          <SentinelIcon size={28} />
           <span className="brand-text">SURL</span>
         </div>
         <div className="nav-links">
@@ -303,10 +264,27 @@ export default function App() {
           <a href="#how">How it works</a>
           <a href="#team">Team</a>
         </div>
-        <button className="btn-ghost" onClick={handleStart}>
+        <button className="btn-ghost nav-launch" onClick={handleStart}>
           Launch App →
         </button>
+        {/* Hamburger – visible on mobile only */}
+        <button
+          className={`nav-hamburger ${menuOpen ? "open" : ""}`}
+          onClick={() => setMenuOpen((o) => !o)}
+          aria-label="Toggle navigation menu"
+          aria-expanded={menuOpen}
+        >
+          <span /><span /><span />
+        </button>
       </nav>
+
+      {/* ── MOBILE MENU DRAWER ── */}
+      <div className={`mobile-menu ${menuOpen ? "open" : ""}`}>
+        <a href="#features" onClick={closeMenu}>Features</a>
+        <a href="#how" onClick={closeMenu}>How it works</a>
+        <a href="#team" onClick={closeMenu}>Team</a>
+        <button className="btn-ghost" onClick={handleStart}>Launch App →</button>
+      </div>
 
       {/* ── HERO ── */}
       <section className={`hero ${visible ? "hero-in" : ""}`}>
@@ -455,7 +433,7 @@ export default function App() {
       </section>
 
       {/* ── BOOT OVERLAY ── */}
-      {booting && <BootOverlay onDone={() => setBooting(false)} />}
+      {booting && <BootOverlay />}
     </>
   );
 }
